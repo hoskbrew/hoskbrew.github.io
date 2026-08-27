@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NES to UF2 Firmware Patcher</title>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; background: #f9f9f9; color: #333; }
+        .card { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .form-group { margin-bottom: 1.5rem; }
+        label { display: block; font-weight: bold; margin-bottom: 0.5rem; }
+        input[type="file"] { display: block; width: 100%; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+        button { background: #0066cc; color: white; border: none; padding: 0.75rem 1.5rem; font-size: 1rem; border-radius: 4px; cursor: pointer; transition: background 0.2s; }
+        button:hover { background: #0052a3; }
+        button:disabled { background: #cccccc; cursor: not-allowed; }
+        pre { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 4px; overflow-x: auto; max-height: 300px; }
+        
+        /* New styles for the file manager list */
+        .file-list { list-style: none; padding: 0; margin: 0.5rem 0 0 0; border: 1px solid #e0e0e0; border-radius: 4px; max-height: 250px; overflow-y: auto; background: #fafafa; }
+        .file-list li { display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0.75rem; border-bottom: 1px solid #e0e0e0; background: #fff; }
+        .file-list li:last-child { border-bottom: none; }
+        .file-name { font-family: monospace; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 1rem; }
+        .file-actions { display: flex; gap: 0.25rem; flex-shrink: 0; }
+        .file-actions button { padding: 0.25rem 0.5rem; font-size: 0.8rem; border-radius: 3px; }
+        .btn-up, .btn-down { background: #e0e0e0; color: #333; }
+        .btn-up:hover, .btn-down:hover { background: #d0d0d0; }
+        .btn-delete { background: #dc3545; }
+        .btn-delete:hover { background: #c82333; }
+        .empty-list { padding: 1rem; text-align: center; color: #777; font-size: 0.9rem; font-style: italic; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2>NES to UF2 Firmware Patcher</h2>
+    <div class="form-group">
+        <label for="uf2In">Base Firmware (.uf2)</label>
+        <sup>
+            Be sure to match your firmware with your board configuration.
+        </sup>
+        <input type="file" id="uf2In" accept=".uf2">
+    </div>
+
+    <div class="form-group">
+        <label for="nesFiles">Add NES ROMs (.nes)</label>
+        <sup>
+            When using multiple ROMs, the first ROM should be the multicart loader.
+        </sup>
+        <input type="file" id="nesFiles" accept=".nes" multiple>
+        <ul id="fileList" class="file-list">
+            <div class="empty-list">No ROMs added yet.</div>
+        </ul>
+    </div>
+
+    <button id="processBtn">Patch Firmware</button>
+
+    <div class="form-group" style="margin-top: 1.5rem;">
+        <label>Log Output:</label>
+        <pre id="log"></pre>
+    </div>
+</div>
+
+<script>
+    const HEADERS_BEGIN = 0x10070000;
+    const ROMS_BEGIN = 0x10080000;
+    const HEADER_SPANS = 16;
+    const ROM_SIZE = 1024 * 15872;
+
+    const logEl = document.getElementById('log');
+    function log(msg) {
+        logEl.textContent += msg + '\n';
+        logEl.scrollTop = logEl.scrollHeight;
+        console.log(msg);
+    }
+
+    // --- FILE MANAGER LOGIC ---
+    let nesFilesArray = [];
+    const fileListEl = document.getElementById('fileList');
+    const nesFilesInput = document.getElementById('nesFiles');
+
+    // Handle adding new files to our array
+    nesFilesInput.addEventListener('change', (e) => {
+        const files = Array.from(e.target.files);
+        nesFilesArray.push(...files);
+        e.target.value = ''; // Reset input so the same files can be selected again if needed
+        renderFileList();
+    });
+
+    // Render the file list UI
+    function renderFileList() {
+        fileListEl.innerHTML = ''; // clear current list
+
+        if (nesFilesArray.length === 0) {
+            fileListEl.innerHTML = '<div class="empty-list">No ROMs added yet.</div>';
+            return;
+        }
+
+        nesFilesArray.forEach((file, index) => {
+            const li = document.createElement('li');
+            
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'file-name';
+            nameSpan.textContent = `${index + 1}. ${file.name}`;
+            
+            const actionsDiv = document.createElement('div');
+            actionsDiv.className = 'file-actions';
+
+            // Up button
+            const upBtn = document.createElement('button');
+            upBtn.className = 'btn-up';
+            upBtn.textContent = '▲';
+            upBtn.disabled = index === 0;
+            upBtn.onclick = () => moveFile(index, -1);
+
+            // Down button
+            const downBtn = document.createElement('button');
+            downBtn.className = 'btn-down';
+            downBtn.textContent = '▼';
+            downBtn.disabled = index === nesFilesArray.length - 1;
+            downBtn.onclick = () => moveFile(index, 1);
+
+            // Delete button
+            const delBtn = document.createElement('button');
+            delBtn.className = 'btn-delete';
+            delBtn.textContent = '✕';
+            delBtn.onclick = () => removeFile(index);
+
+            actionsDiv.appendChild(upBtn);
+            actionsDiv.appendChild(downBtn);
+            actionsDiv.appendChild(delBtn);
+
+            li.appendChild(nameSpan);
+            li.appendChild(actionsDiv);
+            fileListEl.appendChild(li);
+        });
+    }
+
+    function moveFile(index, direction) {
+        const newIndex = index + direction;
+        if (newIndex < 0 || newIndex >= nesFilesArray.length) return;
+        
+        // Swap elements
+        const temp = nesFilesArray[index];
+        nesFilesArray[index] = nesFilesArray[newIndex];
+        nesFilesArray[newIndex] = temp;
+        
+        renderFileList();
+    }
+
+    function removeFile(index) {
+        nesFilesArray.splice(index, 1);
+        renderFileList();
+    }
+    // --------------------------
+
+    // Identifies spans consisting of all $00, or all $FF
+    function findSpans(data) {
+        let spans = [];
+        let total = 0;
+        let data_size = data.length;
+
+        for (let i = 0; i < data_size;) {
+            let match = data[i];
+            if (match !== 0 && match !== 0xFF) {
+                i += 256;
+                continue;
+            }
+
+            let j = i;
+            while (j < data_size && data[j] === match) {
+                j++;
+            }
+
+            let size = j - i;
+            if (size < 1024) {
+                i += 256;
+                continue;
+            }
+
+            total += size;
+            let scale = size === 0 ? 0 : 31 - Math.clz32(size);
+            
+            // Force unsigned 32-bit for JS bitwise ops
+            let spanVal = ((i & 0xFFFFFF) | (scale << 24)) >>> 0;
+            spans.push(spanVal);
+            
+            log(`Empty span: ${i} ${1 << scale}`);
+            i += 1 << scale;
+        }
+
+        spans.sort((a, b) => b - a); // descending
+
+        while (spans.length < HEADER_SPANS) {
+            spans.push(0);
+        }
+
+        let out = spans.slice(0, HEADER_SPANS);
+        for (let i = 0; i < HEADER_SPANS; ++i) {
+            if (out[i] !== 0) {
+                log(`Span: ${out[i] & 0xFFFFFF} ${1 << (out[i] >>> 24)}`);
+            }
+        }
+        log(`Total free: ${total}`);
+        return out;
+    }
+
+    function parseInes(ines) {
+        let m = {
+            type: 0, sub: 0, flags: 0, 
+            prg_size: 0, chrrom_size: 0, chrram_size: 0
+        };
+
+        m.type = ines[6] >> 4;
+        m.type |= ines[7] & 0xF0;
+        m.type |= (ines[8] & 0x0F) << 8;
+
+        m.sub = ines[8] >> 4;
+        m.flags = ines[6] & 0xF;
+
+        m.prg_size = ines[4];
+        m.prg_size |= (ines[9] & 0xF) << 8;
+        m.prg_size *= (1024 * 16);
+
+        m.chrrom_size = ines[5];
+        m.chrrom_size |= (ines[9] & 0xF0) << 4;
+        m.chrrom_size *= (1024 * 8);
+
+        m.chrram_size = (ines[11] & 0xF) ? 64 << (ines[11] & 0xF) : 0;
+
+        if (m.chrrom_size === 0 && m.chrram_size === 0) {
+            m.chrram_size = 8192;
+        }
+
+        log(`Size = PRG:${m.prg_size} CHR-ROM:${m.chrrom_size} CHR-RAM:${m.chrram_size}`);
+        return m;
+    }
+
+    function createHeaderBuffer(ines, offset, size, name, spans) {
+        let buf = new Uint8Array(256);
+        let view = new DataView(buf.buffer);
+
+        buf.set(ines, 0); // 16 bytes
+        view.setUint32(16, offset, true);
+        view.setUint32(20, size, true);
+
+        // name at offset 32
+        let encoder = new TextEncoder();
+        let nameBytes = encoder.encode(name.substring(0, 31));
+        buf.set(nameBytes, 32);
+
+        // spans at offset 64
+        for (let i = 0; i < HEADER_SPANS; i++) {
+            view.setUint32(64 + (i * 4), spans[i], true);
+        }
+
+        return buf;
+    }
+
+    function downloadBlob(data, filename) {
+        const blob = new Blob([data], { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+
+    document.getElementById('processBtn').addEventListener('click', async () => {
+        logEl.textContent = ''; // Clear log
+
+        const uf2File = document.getElementById('uf2In').files[0];
+
+        if (!uf2File) {
+            return log("Error: Please select a base .uf2 file.");
+        }
+        if (nesFilesArray.length === 0) {
+            return log("Error: Please add at least one .nes file.");
+        }
+
+        try {
+            // Allocate memory
+            const headers = new Uint8Array(256 * 256); // 256 headers max
+            const roms = new Uint8Array(ROM_SIZE * 2);
+
+            let num_headers = 0;
+            let rom_offset = 0;
+
+            log("Reading NES files...");
+            for (let i = 0; i < nesFilesArray.length; i++) {
+                let file = nesFilesArray[i];
+                log(`\nProcessing [${i + 1}/${nesFilesArray.length}]: ${file.name}`);
+                
+                let arrayBuffer = await file.arrayBuffer();
+                let nesData = new Uint8Array(arrayBuffer);
+
+                if (nesData.length < 16) {
+                    throw new Error(`File ${file.name} is too small.`);
+                }
+
+                let ines = nesData.slice(0, 16);
+                let mapper = parseInes(ines);
+                let headerSize = mapper.prg_size + mapper.chrrom_size;
+
+                let nesOffset = 16;
+                if (mapper.flags & 0b100) { // Trainer
+                    nesOffset += 512;
+                }
+
+                let romData = nesData.slice(nesOffset, nesOffset + headerSize);
+                if (romData.length !== headerSize) {
+                    throw new Error(`Size mismatch in ${file.name}`);
+                }
+
+                let spans = findSpans(romData);
+
+                if (mapper.flags & 0b10) { // Battery save
+                    headerSize += 8192;
+                }
+
+                let headerBuf = createHeaderBuffer(ines, rom_offset, headerSize, file.name, spans);
+                headers.set(headerBuf, num_headers * 256);
+
+                roms.set(romData, rom_offset);
+                rom_offset += headerSize;
+                num_headers++;
+
+                if (rom_offset > ROM_SIZE) {
+                    throw new Error("Out of storage.");
+                }
+            }
+
+            const HEADERS_END = HEADERS_BEGIN + num_headers * 256;
+            const ROMS_END = ROMS_BEGIN + rom_offset;
+
+            log("\nPatching UF2 File...");
+            let uf2Buffer = await uf2File.arrayBuffer();
+            let outBlocks = [];
+            let blockNum = 0;
+
+            for (let offset = 0; offset < uf2Buffer.byteLength; offset += 512) {
+                let blockBuf = uf2Buffer.slice(offset, offset + 512);
+                let blockView = new DataView(blockBuf);
+                let block8 = new Uint8Array(blockBuf);
+
+                let magic0 = blockView.getUint32(0, true);
+                let magic1 = blockView.getUint32(4, true);
+                let magicEnd = blockView.getUint32(508, true);
+
+                if (magic0 !== 0x0A324655 || magic1 !== 0x9E5D5157 || magicEnd !== 0x0AB16F30) {
+                    outBlocks.push(block8);
+                    continue;
+                }
+
+                let flags = blockView.getUint32(8, true);
+                let targetAddr = blockView.getUint32(12, true);
+                let payloadSize = blockView.getUint32(16, true);
+                let fileSize = blockView.getUint32(28, true); // family_id
+
+                if (payloadSize > 476 || (flags & 1) || (flags & 0x4000) || fileSize !== 3834380121) {
+                    outBlocks.push(block8);
+                    continue;
+                }
+
+                // C++ Logic to skip writing certain blocks
+                if (targetAddr > HEADERS_END && targetAddr + payloadSize <= ROMS_BEGIN) continue;
+                if (targetAddr >= ROMS_END && targetAddr + payloadSize <= ROMS_BEGIN + 15872 * 1024) continue;
+
+                // Overlay HEADERS
+                let beginH = Math.max(targetAddr, HEADERS_BEGIN);
+                let endH = Math.min(targetAddr + payloadSize, HEADERS_END);
+                if (endH > beginH) {
+                    let srcOffset = beginH - HEADERS_BEGIN;
+                    let dstOffset = 32 + (beginH - targetAddr);
+                    block8.set(headers.slice(srcOffset, srcOffset + (endH - beginH)), dstOffset);
+                }
+
+                // Overlay ROMS
+                let beginR = Math.max(targetAddr, ROMS_BEGIN);
+                let endR = Math.min(targetAddr + payloadSize, ROMS_END);
+                if (endR > beginR) {
+                    let srcOffset = beginR - ROMS_BEGIN;
+                    let dstOffset = 32 + (beginR - targetAddr);
+                    block8.set(roms.slice(srcOffset, srcOffset + (endR - beginR)), dstOffset);
+                }
+
+                blockView.setUint32(20, blockNum++, true); // block_num
+                outBlocks.push(block8);
+            }
+
+            // Update num_blocks for all valid blocks
+            let finalBlockCount = outBlocks.length;
+            let finalBuf = new Uint8Array(finalBlockCount * 512);
+            
+            for (let i = 0; i < finalBlockCount; i++) {
+                let block = outBlocks[i];
+                let view = new DataView(block.buffer);
+                if (view.getUint32(28, true) === 3834380121) {
+                    view.setUint32(24, finalBlockCount, true); // num_blocks
+                }
+                finalBuf.set(block, i * 512);
+            }
+
+            log(`\nSuccessfully built firmware! Block count = ${finalBlockCount}`);
+            downloadBlob(finalBuf, "patched_firmware.uf2");
+
+        } catch (err) {
+            log(`\nError: ${err.message}`);
+        }
+    });
+</script>
+</body>
+</html>
+
